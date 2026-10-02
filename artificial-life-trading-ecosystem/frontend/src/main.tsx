@@ -2,9 +2,12 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
+import { ExperimentProvider } from './contexts/ExperimentContext'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <ExperimentProvider>
+      <App />
+    </ExperimentProvider>
   </StrictMode>,
 )

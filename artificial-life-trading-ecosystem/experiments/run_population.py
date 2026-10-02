@@ -67,16 +67,31 @@ def _evolution_epochs(market: pd.DataFrame, *, generation_count: int) -> list[pd
         raise ValueError("The evolution-development segment is empty. Adjust the data split proportions.")
     if generation_count <= 0:
         raise ValueError("The number of generations must be positive.")
-    epoch_count = min(int(generation_count), max(1, len(development)))
-    indices = np.array_split(np.arange(len(development)), epoch_count)
-    return [development.iloc[idx].reset_index(drop=True).copy() for idx in indices if len(idx) > 0]
+
+    generation_days = int(settings.generation_trading_days)
+    if generation_days <= 0:
+        raise ValueError("generation_trading_days must be positive.")
+
+    epochs = [
+        development.iloc[i:i + generation_days].reset_index(drop=True).copy()
+        for i in range(0, len(development), generation_days)
+    ]
+    return epochs[:generation_count]
 
 
-def _summarize_generation(population: Population, generation: int) -> dict[str, float | int | str]:
-    stats = population.compute_generation_statistics(population.agents, generation)
+def _summarize_generation(
+    population: Population,
+    generation: int,
+    *,
+    agents=None,
+) -> dict[str, float | int | str]:
+    if agents is None:
+        agents = population.agents
+
+    stats = population.compute_generation_statistics(agents, generation)
     return {
         "generation": int(generation),
-        "population_size": int(len(population.agents)),
+        "population_size": int(len(agents)),
         "alive_count": int(stats.get("alive_count", 0)),
         "dead_count": int(stats.get("dead_count", 0)),
         "survival_rate": float(stats.get("survival_rate", 0.0)),
@@ -94,16 +109,27 @@ def _summarize_generation(population: Population, generation: int) -> dict[str, 
     }
 
 
-def _advance_population(population: Population, epoch: pd.DataFrame, *, feature_columns: list[str]) -> None:
+def _advance_population(
+    population: Population,
+    epoch: pd.DataFrame,
+    *,
+    feature_columns: list[str],
+    forecast_history: pd.DataFrame,
+):
     population.generation = int(population.generation)
-    population.evaluate_generation(epoch, feature_columns=feature_columns)
+    population.evaluate_generation(
+        epoch,
+        feature_columns=feature_columns,
+        forecast_history=forecast_history,
+    )
+    evaluated_agents = list(population.agents)
     population.mark_dead_agents()
     survivors = population.surviving_agents()
 
     if not survivors:
         population.agents = population.zero_survivor_fallback(target_count=population.population_size)
         population.generation = int(population.generation) + 1
-        return
+        return evaluated_agents
 
     elite_count = min(population.elite_count, len(survivors))
     next_agents = population.preserve_elite(survivors[:elite_count]) if elite_count else []
@@ -130,6 +156,7 @@ def _advance_population(population: Population, epoch: pd.DataFrame, *, feature_
 
     population.agents = next_agents[: population.population_size]
     population.generation = int(population.generation) + 1
+    return evaluated_agents
 
 
 def _save_population_outputs(population: Population, generation_history: list[dict[str, float | int | str]]) -> None:
@@ -250,10 +277,45 @@ def main() -> None:
         "starting_capital": settings.starting_capital,
     })
 
-    for generation_index, epoch in enumerate(development_epochs[: max(1, min(args.generations, len(development_epochs)) )]):
+    for generation_index, epoch in enumerate(development_epochs[: max(1, min(args.generations, len(development_epochs)))]):
         population.generation = generation_index
-        _advance_population(population, epoch, feature_columns=feature_columns)
-        summary = _summarize_generation(population, generation_index)
+
+        # The processed feature set intentionally has no Date column.
+        # Use positional history instead: train + validation + all
+        # evolution rows available through the current generation.
+        splits_for_history = chronological_split(
+            market,
+            train_proportion=settings.train_proportion,
+            validation_proportion=settings.validation_proportion,
+            evolution_proportion=settings.evolution_proportion,
+            test_proportion=settings.test_proportion,
+        )
+        rows_in_current_generation = sum(
+            len(previous_epoch)
+            for previous_epoch in development_epochs[: generation_index + 1]
+        )
+        history_end = (
+            len(splits_for_history["train"])
+            + len(splits_for_history["validation"])
+            + rows_in_current_generation
+        )
+        forecast_history = (
+            market.iloc[:history_end]
+            .copy()
+            .reset_index(drop=True)
+        )
+
+        evaluated_agents = _advance_population(
+            population,
+            epoch,
+            feature_columns=feature_columns,
+            forecast_history=forecast_history,
+        )
+        summary = _summarize_generation(
+            population,
+            generation_index,
+            agents=evaluated_agents,
+        )
         generation_history.append(summary)
 
         print({
